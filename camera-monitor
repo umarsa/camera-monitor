@@ -1,0 +1,41 @@
+#!/bin/zsh
+set -eu
+
+TOOL_DIR=${0:A:h}
+APP="$TOOL_DIR/CameraMonitor.app"
+EXECUTABLE="$APP/Contents/MacOS/camera-monitor"
+
+build() {
+  /usr/bin/make -s -C "$TOOL_DIR"
+}
+
+case "${1:-open}" in
+  open)
+    build
+    /usr/bin/open -a "$APP"
+    ;;
+  foreground)
+    build
+    exec "$EXECUTABLE"
+    ;;
+  stop)
+    /usr/bin/pkill -x camera-monitor 2>/dev/null && print "stopped" || print "not running"
+    ;;
+  status)
+    /usr/bin/pgrep -qx camera-monitor && print "running" || print "not running"
+    ;;
+  test)
+    build
+    if (( $# >= 3 )); then
+      exec "$EXECUTABLE" --headless-test "${2:-15}" --delay "$3"
+    fi
+    exec "$EXECUTABLE" --headless-test "${2:-15}"
+    ;;
+  build)
+    build
+    ;;
+  *)
+    print -u2 "usage: camera-monitor [open|foreground|stop|status|test [seconds] [delay]|build]"
+    exit 2
+    ;;
+esac

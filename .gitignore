@@ -1,0 +1,8 @@
+.DS_Store
+CameraMonitor.app/
+dist/
+*.tmp
+*.log
+settings.conf
+window-state.txt
+instance.lock
