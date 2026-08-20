@@ -109,6 +109,7 @@ Useful development commands:
 ./camera-monitor stop
 ./camera-monitor test 15         # exercise every saved camera stream
 ./camera-monitor test 10 5       # test all streams with a 5-second delay
+./camera-monitor install          # self-contained build into /Applications
 ```
 
 `make check` is offline and credential-free. It verifies private settings-file

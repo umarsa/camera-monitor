@@ -34,8 +34,14 @@ case "${1:-open}" in
   build)
     build
     ;;
+  install)
+    /usr/bin/make -s -C "$TOOL_DIR" distribution
+    /usr/bin/pkill -x camera-monitor 2>/dev/null || true
+    /usr/bin/ditto "$TOOL_DIR/dist/CameraMonitor.app" "/Applications/CameraMonitor.app"
+    print "installed /Applications/CameraMonitor.app"
+    ;;
   *)
-    print -u2 "usage: camera-monitor [open|foreground|stop|status|test [seconds] [delay]|build]"
+    print -u2 "usage: camera-monitor [open|foreground|stop|status|test [seconds] [delay]|build|install]"
     exit 2
     ;;
 esac
