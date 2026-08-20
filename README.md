@@ -35,6 +35,9 @@ ID or notarized, so follow the [first-launch instructions](#installing-the-unsig
   memory cost of retaining raw video frames.
 - Latest-frame-only rendering after decoding to prevent unintended latency.
 - VideoToolbox hardware decoding when supported by FFmpeg.
+- Per-camera zoom up to 8x: scroll or pinch over a cell to zoom at the cursor,
+  drag to pan, double-click to reset. A zoomed cell shows a minimap of the full
+  frame and snaps back after 30 seconds unless you click its lock button.
 - Remembered window position, size, and Always on Top state.
 - A single-instance lock, so opening the app twice cannot duplicate streams.
 - No recording, analytics, cloud service, or external network dependency.
@@ -157,6 +160,9 @@ new Mac.
 ## Controls
 
 - `Command-,`: Settings
+- Scroll wheel or pinch over a camera: zoom at the cursor (1x to 8x)
+- Drag: pan a zoomed camera. Double-click: reset it to fit
+- Lock button (top-right of a zoomed camera): keep the zoom past the 30-second auto-reset
 - `T`: Toggle Always on Top
 - `Q` or `Escape`: Quit
 

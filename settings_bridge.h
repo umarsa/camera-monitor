@@ -28,6 +28,7 @@ struct SDL_Window;
 extern "C" {
 void configureMacWindowAspect(SDL_Window *window, double width, double height);
 void configureMacApplicationMenu(void);
+void installMacPinchMonitor(void);
 int consumeMacSettingsRequest(void);
 int showMacSettingsDialog(SDL_Window *parent, CameraMonitorSettings *settings);
 }

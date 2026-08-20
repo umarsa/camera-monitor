@@ -48,6 +48,9 @@ constexpr int64_t kReadTimeoutUs = 5'000'000;
 constexpr int64_t kFrameStallTimeoutUs = 5'000'000;
 constexpr int kMaximumDelaySeconds = 30;
 constexpr size_t kMaximumDelayedPacketBytes = 96 * 1024 * 1024;
+constexpr double kMaximumZoom = 8.0;
+constexpr auto kZoomResetAfter = 30s;
+constexpr auto kZoomResetAnimation = 300ms;
 
 std::atomic<bool> gRunning{true};
 
@@ -744,6 +747,97 @@ SDL_Rect fittedRect(int contentWidth, int contentHeight, const SDL_Rect &bounds)
     return result;
 }
 
+// Zoom is expressed in frame fractions (centre 0.5,0.5 at 1x) so it stays
+// proportional across window resizes without any extra handling.
+struct ZoomView {
+    double zoom = 1.0;
+    double centreX = 0.5;
+    double centreY = 0.5;
+};
+
+ZoomView clampView(ZoomView view) {
+    view.zoom = std::clamp(view.zoom, 1.0, kMaximumZoom);
+    const double half = 0.5 / view.zoom;
+    view.centreX = std::clamp(view.centreX, half, 1.0 - half);
+    view.centreY = std::clamp(view.centreY, half, 1.0 - half);
+    return view;
+}
+
+// u, v are the cursor position as fractions of the currently visible region.
+// The frame point under the cursor stays fixed while the zoom changes.
+ZoomView zoomViewAround(ZoomView view, double factor, double u, double v) {
+    const double frameX = view.centreX + (u - 0.5) / view.zoom;
+    const double frameY = view.centreY + (v - 0.5) / view.zoom;
+    view.zoom = std::clamp(view.zoom * factor, 1.0, kMaximumZoom);
+    view.centreX = frameX - (u - 0.5) / view.zoom;
+    view.centreY = frameY - (v - 0.5) / view.zoom;
+    return clampView(view);
+}
+
+SDL_Rect zoomedSourceRect(int width, int height, const ZoomView &view) {
+    const int sourceWidth = std::clamp(
+        static_cast<int>(std::lround(width / view.zoom)), 1, std::max(1, width));
+    const int sourceHeight = std::clamp(
+        static_cast<int>(std::lround(height / view.zoom)), 1, std::max(1, height));
+    const int x = std::clamp(
+        static_cast<int>(std::lround(view.centreX * width - sourceWidth / 2.0)),
+        0, std::max(0, width - sourceWidth));
+    const int y = std::clamp(
+        static_cast<int>(std::lround(view.centreY * height - sourceHeight / 2.0)),
+        0, std::max(0, height - sourceHeight));
+    return SDL_Rect{x, y, sourceWidth, sourceHeight};
+}
+
+struct ZoomState {
+    ZoomView view;
+    bool locked = false;
+    Clock::time_point lastInteraction{};
+    bool animating = false;
+    ZoomView animationStart;
+    Clock::time_point animationBegan{};
+
+    ZoomView current(Clock::time_point now) const {
+        if (!animating) return view;
+        const double elapsed =
+            std::chrono::duration<double>(now - animationBegan).count() /
+            std::chrono::duration<double>(kZoomResetAnimation).count();
+        const double t = std::clamp(elapsed, 0.0, 1.0);
+        const double eased = 1.0 - std::pow(1.0 - t, 3.0);
+        ZoomView blended;
+        blended.zoom = animationStart.zoom + (view.zoom - animationStart.zoom) * eased;
+        blended.centreX = animationStart.centreX +
+                          (view.centreX - animationStart.centreX) * eased;
+        blended.centreY = animationStart.centreY +
+                          (view.centreY - animationStart.centreY) * eased;
+        return clampView(blended);
+    }
+
+    bool zoomed(Clock::time_point now) const { return current(now).zoom > 1.0001; }
+
+    // Any interaction commits the in-flight animation and restarts the timer.
+    void touch(Clock::time_point now) {
+        view = current(now);
+        animating = false;
+        lastInteraction = now;
+    }
+
+    void resetToFit(Clock::time_point now) {
+        animationStart = current(now);
+        view = ZoomView{};
+        animating = animationStart.zoom > 1.0001;
+        animationBegan = now;
+        locked = false;
+    }
+
+    void tick(Clock::time_point now) {
+        if (animating && now - animationBegan >= kZoomResetAnimation) animating = false;
+        if (!locked && !animating && view.zoom > 1.0001 &&
+            now - lastInteraction >= kZoomResetAfter) {
+            resetToFit(now);
+        }
+    }
+};
+
 bool updateTexture(SDL_Renderer *renderer, TextureState &texture,
                    CameraStream &stream) {
     VideoFrame frame;
@@ -857,9 +951,9 @@ void drawText(SDL_Renderer *renderer, const std::string &text, int x, int y,
     }
 }
 
-void renderStatusOverlay(SDL_Renderer *renderer, CameraStream &stream,
-                         const std::string &cameraName,
-                         const SDL_Rect &bounds) {
+SDL_Rect renderStatusOverlay(SDL_Renderer *renderer, CameraStream &stream,
+                             const std::string &cameraName,
+                             const SDL_Rect &bounds, int fps) {
     const int scale = bounds.w < 500 ? 1 : 2;
     const StreamState currentState = stream.state();
     const bool fresh = stream.isFresh();
@@ -875,6 +969,7 @@ void renderStatusOverlay(SDL_Renderer *renderer, CameraStream &stream,
                    });
     if (displayName.size() > 20) displayName = displayName.substr(0, 19) + ".";
     std::string title = displayName + "  " + displayedState;
+    if (!warning && fps > 0) title += "  " + std::to_string(fps) + " FPS";
     if (stream.delaySeconds() > 0) {
         title += "  " + std::to_string(stream.delaySeconds()) + "S DELAY";
     }
@@ -903,26 +998,117 @@ void renderStatusOverlay(SDL_Renderer *renderer, CameraStream &stream,
         drawText(renderer, detail, textX,
                  background.y + 13 + lineHeight, scale);
     }
+    return background;
+}
+
+int overlayScale(const SDL_Rect &bounds) { return bounds.w < 500 ? 1 : 2; }
+
+std::string zoomLabel(double zoom, bool locked) {
+    char buffer[32];
+    std::snprintf(buffer, sizeof buffer, "%.1fX %s", zoom,
+                  locked ? "ZOOM LOCKED" : "LOCK ZOOM");
+    return buffer;
+}
+
+// Everything that says "this cell is zoomed": a coloured cell border, a
+// minimap of the full frame with the visible region outlined, and the zoom
+// factor inside the lock button, which sits beside the status pill. Amber when
+// locked, blue while the 30s auto-reset timer is running. Returns the button.
+SDL_Rect renderZoomHud(SDL_Renderer *renderer, const TextureState &texture,
+                       const SDL_Rect &bounds, const SDL_Rect &statusPill,
+                       const ZoomView &view, bool locked) {
+    const int scale = overlayScale(bounds);
+    const Uint8 red = locked ? 245 : 110;
+    const Uint8 green = locked ? 166 : 180;
+    const Uint8 blue = locked ? 35 : 255;
+
+    const int thickness = 2 * scale;
+    SDL_SetRenderDrawColor(renderer, red, green, blue, 255);
+    const SDL_Rect edges[4] = {
+        {bounds.x, bounds.y, bounds.w, thickness},
+        {bounds.x, bounds.y + bounds.h - thickness, bounds.w, thickness},
+        {bounds.x, bounds.y, thickness, bounds.h},
+        {bounds.x + bounds.w - thickness, bounds.y, thickness, bounds.h}};
+    SDL_RenderFillRects(renderer, edges, 4);
+
+    if (texture.texture && texture.width > 0 && texture.height > 0) {
+        SDL_Rect map{bounds.x + 10, bounds.y + 10, bounds.w * 22 / 100, 0};
+        map.h = map.w * texture.height / texture.width;
+        const SDL_Rect frame{map.x - 2, map.y - 2, map.w + 4, map.h + 4};
+        SDL_SetRenderDrawColor(renderer, 5, 7, 10, 230);
+        SDL_RenderFillRect(renderer, &frame);
+        SDL_RenderCopy(renderer, texture.texture, nullptr, &map);
+
+        const SDL_Rect source = zoomedSourceRect(texture.width, texture.height, view);
+        const SDL_Rect visible{map.x + source.x * map.w / texture.width,
+                               map.y + source.y * map.h / texture.height,
+                               std::max(4, source.w * map.w / texture.width),
+                               std::max(4, source.h * map.h / texture.height)};
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 130);
+        const SDL_Rect shade[4] = {
+            {map.x, map.y, map.w, visible.y - map.y},
+            {map.x, visible.y + visible.h, map.w,
+             map.y + map.h - visible.y - visible.h},
+            {map.x, visible.y, visible.x - map.x, visible.h},
+            {visible.x + visible.w, visible.y,
+             map.x + map.w - visible.x - visible.w, visible.h}};
+        SDL_RenderFillRects(renderer, shade, 4);
+        SDL_SetRenderDrawColor(renderer, red, green, blue, 255);
+        SDL_RenderDrawRect(renderer, &visible);
+        const SDL_Rect inner{visible.x + 1, visible.y + 1, visible.w - 2, visible.h - 2};
+        if (inner.w > 0 && inner.h > 0) SDL_RenderDrawRect(renderer, &inner);
+    }
+
+    const int lineHeight = 7 * scale;
+    const SDL_Rect button{statusPill.x + statusPill.w + 8,
+                          statusPill.y + statusPill.h - lineHeight - 18,
+                          textWidth(zoomLabel(kMaximumZoom, true), scale) + 20,
+                          lineHeight + 18};
+    if (locked) {
+        SDL_SetRenderDrawColor(renderer, red, green, blue, 235);
+        SDL_RenderFillRect(renderer, &button);
+    } else {
+        SDL_SetRenderDrawColor(renderer, 5, 7, 10, 200);
+        SDL_RenderFillRect(renderer, &button);
+        SDL_SetRenderDrawColor(renderer, red, green, blue, 255);
+        SDL_RenderDrawRect(renderer, &button);
+    }
+    const std::string label = zoomLabel(view.zoom, locked);
+    drawText(renderer, label,
+             button.x + (button.w - textWidth(label, scale)) / 2,
+             button.y + 9, scale);
+    return button;
 }
 
 void renderStream(SDL_Renderer *renderer, TextureState &texture,
                   CameraStream &stream, const std::string &cameraName,
-                  const SDL_Rect &bounds) {
+                  const SDL_Rect &bounds, const ZoomView &view, bool locked,
+                  int fps, SDL_Rect &lockButton) {
     SDL_SetRenderDrawColor(renderer, 12, 14, 17, 255);
     SDL_RenderFillRect(renderer, &bounds);
 
     if (texture.texture) {
         const SDL_Rect destination = fittedRect(texture.width, texture.height, bounds);
-        SDL_RenderCopy(renderer, texture.texture, nullptr, &destination);
+        const SDL_Rect source = zoomedSourceRect(texture.width, texture.height, view);
+        SDL_RenderCopy(renderer, texture.texture, &source, &destination);
     }
 
-    renderStatusOverlay(renderer, stream, cameraName, bounds);
+    const SDL_Rect pill = renderStatusOverlay(renderer, stream, cameraName, bounds, fps);
+    lockButton = SDL_Rect{};
+    if (view.zoom > 1.0001) {
+        lockButton = renderZoomHud(renderer, texture, bounds, pill, view, locked);
+    }
 }
 
 struct ActiveCamera {
     std::string name;
     std::unique_ptr<CameraStream> stream;
     std::unique_ptr<TextureState> texture;
+    ZoomState zoom;  // runtime only; recreated with the camera on settings save
+    uint64_t fpsFrameCount = 0;
+    Clock::time_point fpsSampledAt{};
+    int fps = 0;
+    SDL_Rect lockButton{};  // where the lock was last drawn; empty when not zoomed
 };
 
 void stopCameras(std::vector<ActiveCamera> &cameras) {
@@ -1159,6 +1345,35 @@ int selfTest() {
         }
     }
 
+    const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-9; };
+    ZoomView view = clampView(ZoomView{0.5, 0.1, 0.9});
+    success = success && view.zoom == 1.0 && view.centreX == 0.5 &&
+              view.centreY == 0.5;
+    view = clampView(ZoomView{20.0, 0.0, 1.0});
+    success = success && view.zoom == kMaximumZoom &&
+              near(view.centreX, 0.0625) && near(view.centreY, 0.9375);
+    view = zoomViewAround(ZoomView{}, 2.0, 0.25, 0.25);
+    success = success && near(view.zoom, 2.0) && near(view.centreX, 0.375) &&
+              near(view.centreY, 0.375);
+    SDL_Rect region = zoomedSourceRect(1920, 1080, view);
+    success = success && region.x == 240 && region.y == 135 &&
+              region.w == 960 && region.h == 540;
+    success = success && region.x + region.w / 4 == 480;  // cursor point held
+    view = zoomViewAround(view, 100.0, 0.0, 0.0);
+    region = zoomedSourceRect(1920, 1080, view);
+    success = success && near(view.zoom, kMaximumZoom) && region.w == 240 &&
+              region.h == 135 && region.x >= 0 && region.y >= 0 &&
+              region.x + region.w <= 1920 && region.y + region.h <= 1080;
+    view.centreX += 5.0;
+    view.centreY -= 5.0;
+    view = clampView(view);
+    region = zoomedSourceRect(1920, 1080, view);
+    success = success && region.x == 1920 - 240 && region.y == 0;
+    view = zoomViewAround(view, 0.01, 0.5, 0.5);
+    region = zoomedSourceRect(1920, 1080, view);
+    success = success && view.zoom == 1.0 && region.x == 0 && region.y == 0 &&
+              region.w == 1920 && region.h == 1080;
+
     std::cout << (success ? "self-test passed\n" : "self-test failed\n");
     return success ? 0 : 1;
 }
@@ -1269,6 +1484,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     configureMacApplicationMenu();
+    installMacPinchMonitor();
     applyWindowLayout(window, settings, true);
     SDL_SetWindowAlwaysOnTop(window, state.alwaysOnTop ? SDL_TRUE : SDL_FALSE);
 
@@ -1309,11 +1525,108 @@ int main(int argc, char **argv) {
     }
 
     bool alwaysOnTop = state.alwaysOnTop;
+    int width = 0, height = 0;
+    LayoutGeometry geometry = layoutGeometry(settings);
+    Clock::time_point now = Clock::now();
+    bool dragging = false;
+    int dragCell = -1;
+
+    // Mouse events arrive in window points; the renderer works in pixels.
+    auto outputPoint = [&](int windowX, int windowY) {
+        int windowWidth = 1, windowHeight = 1;
+        SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+        return SDL_Point{windowX * width / std::max(1, windowWidth),
+                         windowY * height / std::max(1, windowHeight)};
+    };
+    auto cellAt = [&](SDL_Point point) {
+        for (size_t index = 0; index < cameras.size(); ++index) {
+            const SDL_Rect bounds = cameraBounds(
+                static_cast<int>(index), geometry, width, height);
+            if (SDL_PointInRect(&point, &bounds)) return static_cast<int>(index);
+        }
+        return -1;
+    };
+    auto frameRect = [&](int index) {
+        const SDL_Rect bounds = cameraBounds(index, geometry, width, height);
+        return fittedRect(cameras[index].texture->width,
+                          cameras[index].texture->height, bounds);
+    };
+    auto zoomCell = [&](int index, double factor, SDL_Point at) {
+        const SDL_Rect frame = frameRect(index);
+        const double u = (at.x - frame.x) / static_cast<double>(std::max(1, frame.w));
+        const double v = (at.y - frame.y) / static_cast<double>(std::max(1, frame.h));
+        ZoomState &zoom = cameras[index].zoom;
+        if (zoom.locked) return;
+        zoom.touch(now);
+        zoom.view = zoomViewAround(zoom.view, factor, u, v);
+    };
+    auto zoomAtWindowPoint = [&](double factor, int windowX, int windowY) {
+        const SDL_Point at = outputPoint(windowX, windowY);
+        const int index = cellAt(at);
+        if (index >= 0) zoomCell(index, factor, at);
+    };
+    auto panCell = [&](int index, int deltaX, int deltaY) {
+        const SDL_Rect frame = frameRect(index);
+        ZoomState &zoom = cameras[index].zoom;
+        if (zoom.locked) return;
+        zoom.touch(now);
+        ZoomView view = zoom.view;
+        view.centreX -= deltaX / (std::max(1, frame.w) * view.zoom);
+        view.centreY -= deltaY / (std::max(1, frame.h) * view.zoom);
+        zoom.view = clampView(view);
+    };
+
     while (gRunning.load()) {
+        now = Clock::now();
+        SDL_GetRendererOutputSize(renderer, &width, &height);
+        geometry = layoutGeometry(settings);
         bool openSettings = consumeMacSettingsRequest() != 0;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) gRunning.store(false);
+            if (event.type == SDL_MOUSEWHEEL) {
+                double amount = event.wheel.preciseY;
+                if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) amount = -amount;
+                zoomAtWindowPoint(std::exp(amount * 0.15), event.wheel.mouseX,
+                                  event.wheel.mouseY);
+            }
+            if (event.type == SDL_MULTIGESTURE && event.mgesture.numFingers == 2) {
+                int mouseX = 0, mouseY = 0;
+                SDL_GetMouseState(&mouseX, &mouseY);
+                zoomAtWindowPoint(std::max(0.2, 1.0 + event.mgesture.dDist),
+                                  mouseX, mouseY);
+            }
+            if (event.type == SDL_MOUSEBUTTONDOWN &&
+                event.button.button == SDL_BUTTON_LEFT) {
+                const SDL_Point at = outputPoint(event.button.x, event.button.y);
+                const int index = cellAt(at);
+                if (index >= 0) {
+                    ZoomState &zoom = cameras[index].zoom;
+                    if (SDL_PointInRect(&at, &cameras[index].lockButton)) {
+                        zoom.touch(now);
+                        zoom.locked = !zoom.locked;
+                    } else if (zoom.locked) {
+                        // a locked cell only responds to its lock button
+                    } else if (event.button.clicks == 2) {
+                        zoom.touch(now);
+                        zoom.resetToFit(now);
+                    } else {
+                        dragging = true;
+                        dragCell = index;
+                    }
+                }
+            }
+            if (event.type == SDL_MOUSEBUTTONUP &&
+                event.button.button == SDL_BUTTON_LEFT) {
+                dragging = false;
+            }
+            if (event.type == SDL_MOUSEMOTION && dragging &&
+                (event.motion.state & SDL_BUTTON_LMASK) &&
+                dragCell < static_cast<int>(cameras.size())) {
+                const SDL_Point origin = outputPoint(0, 0);
+                const SDL_Point delta = outputPoint(event.motion.xrel, event.motion.yrel);
+                panCell(dragCell, delta.x - origin.x, delta.y - origin.y);
+            }
             if (event.type == SDL_KEYDOWN && !event.key.repeat) {
                 if (event.key.keysym.sym == SDLK_ESCAPE ||
                     event.key.keysym.sym == SDLK_q) {
@@ -1331,22 +1644,38 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (openSettings) editSettings();
+        if (openSettings) {
+            editSettings();
+            dragging = false;
+            SDL_GetRendererOutputSize(renderer, &width, &height);
+            geometry = layoutGeometry(settings);
+        }
         for (auto &camera : cameras) {
             updateTexture(renderer, *camera.texture, *camera.stream);
+            camera.zoom.tick(now);
+            if (now - camera.fpsSampledAt >= 3s) {  // RTSP delivery is bursty; 1s swings wildly
+                const uint64_t frames = camera.stream->frameCount();
+                const double seconds =
+                    std::chrono::duration<double>(now - camera.fpsSampledAt).count();
+                camera.fps = seconds < 10.0
+                                 ? static_cast<int>(std::lround(
+                                       (frames - camera.fpsFrameCount) / seconds))
+                                 : 0;
+                camera.fpsFrameCount = frames;
+                camera.fpsSampledAt = now;
+            }
         }
-
-        int width = 0, height = 0;
-        SDL_GetRendererOutputSize(renderer, &width, &height);
 
         SDL_SetRenderDrawColor(renderer, 5, 6, 8, 255);
         SDL_RenderClear(renderer);
-        const LayoutGeometry geometry = layoutGeometry(settings);
         for (size_t index = 0; index < cameras.size(); ++index) {
             const SDL_Rect bounds = cameraBounds(
                 static_cast<int>(index), geometry, width, height);
             renderStream(renderer, *cameras[index].texture,
-                         *cameras[index].stream, cameras[index].name, bounds);
+                         *cameras[index].stream, cameras[index].name, bounds,
+                         cameras[index].zoom.current(now),
+                         cameras[index].zoom.locked, cameras[index].fps,
+                         cameras[index].lockButton);
         }
         SDL_RenderPresent(renderer);
         SDL_Delay(10);

@@ -499,6 +499,23 @@ extern "C" void configureMacApplicationMenu(void) {
     settings.keyEquivalentModifierMask = NSEventModifierFlagCommand;
 }
 
+// SDL does not turn trackpad pinches into SDL_MULTIGESTURE on macOS, so
+// forward the native magnify gesture as one. dDist carries Apple's
+// magnification delta (scale change, roughly -1..1 per gesture).
+extern "C" void installMacPinchMonitor(void) {
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskMagnify
+                                          handler:^NSEvent *(NSEvent *event) {
+        SDL_Event gesture;
+        std::memset(&gesture, 0, sizeof gesture);
+        gesture.type = SDL_MULTIGESTURE;
+        gesture.mgesture.timestamp = SDL_GetTicks();
+        gesture.mgesture.numFingers = 2;
+        gesture.mgesture.dDist = static_cast<float>(event.magnification);
+        SDL_PushEvent(&gesture);
+        return event;
+    }];
+}
+
 extern "C" int consumeMacSettingsRequest(void) {
     return gSettingsRequested.exchange(false) ? 1 : 0;
 }
